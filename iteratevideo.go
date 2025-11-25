@@ -46,7 +46,7 @@ func RunHeartbeatTool() {
 	durations := flag.String("durations", "", "Comma-separated list of durations in seconds (aligns with videos). If single value provided, used for all videos")
 	intervalSec := flag.Int64("interval", 60, "Heartbeat interval in seconds (how much progress each packet activates)")
 	endpoint := flag.String("endpoint", "https://www.yuketang.cn/video-log/heartbeat/", "Heartbeat endpoint URL")
-	sleepMs := flag.Int("sleep-ms", 600, "Milliseconds to sleep between requests")
+	sleepMs := flag.Int("sleep-ms", 1000, "Milliseconds to sleep between requests")
 	flag.Parse()
 
 	if *userID == 0 || *courseID == 0 || *classroomID == "" || *videos == "" {
@@ -83,6 +83,18 @@ func RunHeartbeatTool() {
 
 	// Iterate over videos
 	for idx, vid := range videoIDs {
+		vidStr := idToString(float64(vid)) // Convert int64 to string for GetWatchProgressDetailed
+
+		// Check if video is already completed
+		done, _, err := GetWatchProgressDetailed(idToString(float64(*courseID)), *classroomID, vidStr, cookies)
+		if err != nil {
+			log.Printf("[warn] watch progress check failed for %s: %v\n", vidStr, err)
+			// Continue attempting to send heartbeats if status can't be determined
+		} else if done {
+			log.Printf("skipping heartbeats for video %d (already completed)", vid)
+			continue
+		}
+
 		totalSec := durList[idx]
 		log.Printf("video %d (id=%d) duration=%ds", idx+1, vid, totalSec)
 
@@ -123,41 +135,51 @@ func RunHeartbeatTool() {
 				log.Fatalf("json marshal failed: %v", err)
 			}
 
-			// Build GET request with params=<json>
-			u, err := url.Parse(*endpoint)
-			if err != nil {
-				log.Fatalf("invalid endpoint: %v", err)
+			for {
+				time.Sleep(time.Duration(*sleepMs) * time.Millisecond)
+				// Build GET request with params=<json>
+				u, err := url.Parse(*endpoint)
+				if err != nil {
+					log.Fatalf("invalid endpoint: %v", err)
+				}
+				q := u.Query()
+				q.Set("params", string(b))
+				u.RawQuery = q.Encode()
+
+				req, err := http.NewRequest("GET", u.String(), nil)
+				if err != nil {
+					log.Fatalf("create request failed: %v", err)
+				}
+
+				// Add cookies by iterating the slice (user requested a for ... range ... to add cookies)
+				for _, c := range cookies {
+					req.AddCookie(c)
+				}
+
+				// Common headers
+				req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; heartbeat-bot/1.0)")
+				req.Header.Set("Accept", "application/json, text/plain, */*")
+
+				// Send request
+				resp, err := client.Do(req)
+				if err != nil {
+					log.Printf("request error for vid=%d cp=%d: %v", vid, cp, err)
+					break
+				} else {
+					if resp.StatusCode == 429 {
+						log.Printf("received status 429 (Too Many Requests) for vid=%d cp=%d. Calming down for 5 seconds...", vid, cp)
+						_, _ = io.ReadAll(resp.Body)
+						resp.Body.Close()
+						time.Sleep(5 * time.Second)
+						continue
+					}
+					// Read and discard body
+					_, _ = io.ReadAll(resp.Body)
+					resp.Body.Close()
+					log.Printf("sent heartbeat vid=%d cp=%d -> status=%s", vid, cp, resp.Status)
+					break
+				}
 			}
-			q := u.Query()
-			q.Set("params", string(b))
-			u.RawQuery = q.Encode()
-
-			req, err := http.NewRequest("GET", u.String(), nil)
-			if err != nil {
-				log.Fatalf("create request failed: %v", err)
-			}
-
-			// Add cookies by iterating the slice (user requested a for ... range ... to add cookies)
-			for _, c := range cookies {
-				req.AddCookie(c)
-			}
-
-			// Common headers
-			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; heartbeat-bot/1.0)")
-			req.Header.Set("Accept", "application/json, text/plain, */*")
-
-			// Send request
-			resp, err := client.Do(req)
-			if err != nil {
-				log.Printf("request error for vid=%d cp=%d: %v", vid, cp, err)
-			} else {
-				// Read and discard body
-				_, _ = io.ReadAll(resp.Body)
-				resp.Body.Close()
-				log.Printf("sent heartbeat vid=%d cp=%d -> status=%s", vid, cp, resp.Status)
-			}
-
-			time.Sleep(time.Duration(*sleepMs) * time.Millisecond)
 		}
 
 		// Optionally send one final packet at the exact end to mark completion
@@ -193,29 +215,41 @@ func RunHeartbeatTool() {
 		if err != nil {
 			log.Fatalf("json marshal failed: %v", err)
 		}
-		u, err := url.Parse(*endpoint)
-		if err != nil {
-			log.Fatalf("invalid endpoint: %v", err)
-		}
-		q := u.Query()
-		q.Set("params", string(b))
-		u.RawQuery = q.Encode()
-		req, err := http.NewRequest("GET", u.String(), nil)
-		if err != nil {
-			log.Fatalf("create request failed: %v", err)
-		}
-		for _, c := range cookies {
-			req.AddCookie(c)
-		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; heartbeat-bot/1.0)")
-		req.Header.Set("Accept", "application/json, text/plain, */*")
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("final packet error vid=%d: %v", vid, err)
-		} else {
-			_, _ = io.ReadAll(resp.Body)
-			resp.Body.Close()
-			log.Printf("final heartbeat vid=%d -> status=%s", vid, resp.Status)
+		for {
+			time.Sleep(time.Duration(*sleepMs) * time.Millisecond)
+			u, err := url.Parse(*endpoint)
+			if err != nil {
+				log.Fatalf("invalid endpoint: %v", err)
+			}
+			q := u.Query()
+			q.Set("params", string(b))
+			u.RawQuery = q.Encode()
+			req, err := http.NewRequest("GET", u.String(), nil)
+			if err != nil {
+				log.Fatalf("create request failed: %v", err)
+			}
+			for _, c := range cookies {
+				req.AddCookie(c)
+			}
+			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; heartbeat-bot/1.0)")
+			req.Header.Set("Accept", "application/json, text/plain, */*")
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("final packet error vid=%d: %v", vid, err)
+				break
+			} else {
+				if resp.StatusCode == 429 {
+					log.Printf("received status 429 (Too Many Requests) for final heartbeat vid=%d. Calming down for 5 seconds...", vid)
+					_, _ = io.ReadAll(resp.Body)
+					resp.Body.Close()
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				_, _ = io.ReadAll(resp.Body)
+				resp.Body.Close()
+				log.Printf("final heartbeat vid=%d -> status=%s", vid, resp.Status)
+				break
+			}
 		}
 	}
 

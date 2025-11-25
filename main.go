@@ -240,18 +240,13 @@ func iterateAndHeartbeat(chapters []map[string]interface{}, entry CourseEntry, c
 			if vidStr == "" {
 				continue
 			}
-			// try to get video_length via watch-progress
-			_, raw, _ := GetWatchProgressDetailed(entry.CourseID, entry.ClassroomID, vidStr, cookies)
-			totalSec := int64(60)
-			if vl, ok := parseVideoLengthFromRaw(raw, vidStr); ok {
-				totalSec = vl
-			}
+
 			// parse ids
 			vidInt, _ := strconv.ParseInt(vidStr, 10, 64)
 			cID := entry.CourseID
 			cls := entry.ClassroomID
-			// send heartbeats (default interval 60s)
-			SendHeartbeatsForVideo(cID, cls, userID, vidInt, totalSec, 60, cookies)
+			// send heartbeats
+			SendHeartbeatsForVideo(cID, cls, userID, vidInt, cookies)
 		}
 	}
 }
@@ -306,10 +301,8 @@ func parseVideoLengthFromRaw(raw string, videoID string) (int64, bool) {
 }
 
 // SendHeartbeatsForVideo sends heartbeat GET requests to mark progress for a single video
-func SendHeartbeatsForVideo(courseID string, classroomID string, userID string, videoID int64, totalSec int64, intervalSec int64, cookies []*http.Cookie) {
-	if totalSec <= 0 {
-		totalSec = int64(intervalSec)
-	}
+func SendHeartbeatsForVideo(courseID string, classroomID string, userID string, videoID int64, cookies []*http.Cookie) {
+	const intervalSec = 60
 	client := &http.Client{Timeout: 15 * time.Second}
 	endpoint := "https://www.yuketang.cn/video-log/heartbeat/"
 
@@ -323,7 +316,7 @@ func SendHeartbeatsForVideo(courseID string, classroomID string, userID string, 
 		userNum = v
 	}
 
-	for cp := int64(0); cp < totalSec; cp += int64(intervalSec) {
+	for cp := int64(0); ; cp += int64(intervalSec) {
 		heart := map[string]interface{}{
 			"i":           5,
 			"et":          "loadstart",
@@ -369,53 +362,59 @@ func SendHeartbeatsForVideo(courseID string, classroomID string, userID string, 
 			resp.Body.Close()
 			log.Printf("sent heartbeat vid=%d cp=%d -> status=%s", videoID, cp, resp.Status)
 		}
-		time.Sleep(200 * time.Millisecond)
-	}
+		time.Sleep(1 * time.Second)
 
-	// final packet at exact end
-	cp := totalSec
-	heart := map[string]interface{}{
-		"i":           5,
-		"et":          "timeupdate",
-		"p":           "web",
-		"n":           "ali-cdn.xuetangx.com",
-		"lob":         "ykt",
-		"cp":          cp,
-		"fp":          0,
-		"tp":          cp,
-		"sp":          1,
-		"ts":          fmt.Sprintf("%d", time.Now().UnixNano()/1e6),
-		"u":           userNum,
-		"uip":         "",
-		"c":           courseNum,
-		"v":           videoID,
-		"skuid":       13318608,
-		"classroomid": classroomID,
-		"cc":          "D8E356C1339D5C51B463AB73BD4C026B",
-		"d":           0,
-		"pg":          fmt.Sprintf("%d_ndl0", videoID),
-		"sq":          1,
-		"t":           "video",
-		"cards_id":    0,
-		"slide":       0,
-		"v_url":       "",
-	}
-	body := map[string]interface{}{"heart_data": []interface{}{heart}}
-	b, _ := json.Marshal(body)
-	req, _ := http.NewRequest("POST", endpoint, bytes.NewReader(b))
-	for _, c := range cookies {
-		req.AddCookie(c)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; heartbeat-bot/1.0)")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("final heartbeat error vid=%d: %v", videoID, err)
-	} else {
-		_, _ = io.ReadAll(resp.Body)
-		resp.Body.Close()
-		log.Printf("final heartbeat vid=%d -> status=%s", videoID, resp.Status)
+		// Check for completion
+		done, _, err := GetWatchProgressDetailed(courseID, classroomID, idToString(videoID), cookies)
+		if err == nil && done {
+			log.Printf("video %d completed, sending final heartbeat", videoID)
+			// final packet at exact end
+			cp := cp // Or use a more accurate final progress if available
+			heart := map[string]interface{}{
+				"i":           5,
+				"et":          "timeupdate",
+				"p":           "web",
+				"n":           "ali-cdn.xuetangx.com",
+				"lob":         "ykt",
+				"cp":          cp,
+				"fp":          0,
+				"tp":          cp,
+				"sp":          1,
+				"ts":          fmt.Sprintf("%d", time.Now().UnixNano()/1e6),
+				"u":           userNum,
+				"uip":         "",
+				"c":           courseNum,
+				"v":           videoID,
+				"skuid":       13318608,
+				"classroomid": classroomID,
+				"cc":          "D8E356C1339D5C51B463AB73BD4C026B",
+				"d":           0,
+				"pg":          fmt.Sprintf("%d_ndl0", videoID),
+				"sq":          1,
+				"t":           "video",
+				"cards_id":    0,
+				"slide":       0,
+				"v_url":       "",
+			}
+			body := map[string]interface{}{"heart_data": []interface{}{heart}}
+			b, _ := json.Marshal(body)
+			req, _ := http.NewRequest("POST", endpoint, bytes.NewReader(b))
+			for _, c := range cookies {
+				req.AddCookie(c)
+			}
+			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; heartbeat-bot/1.0)")
+			req.Header.Set("Accept", "application/json, text/plain, */*")
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("final heartbeat error vid=%d: %v", videoID, err)
+			} else {
+				_, _ = io.ReadAll(resp.Body)
+				resp.Body.Close()
+				log.Printf("final heartbeat vid=%d -> status=%s", videoID, resp.Status)
+			}
+			break
+		}
 	}
 }
 
