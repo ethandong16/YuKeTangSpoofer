@@ -523,6 +523,7 @@ func GetWatchProgressDetailed(cid string, videoID string, Cookie []*http.Cookie)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Referer", "https://www.yuketang.cn/")
+	req.Header.Set("xtbz", "ykt")
 	for _, p := range Cookie {
 		req.AddCookie(p)
 	}
@@ -533,7 +534,6 @@ func GetWatchProgressDetailed(cid string, videoID string, Cookie []*http.Cookie)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
-	fmt.Println("get_progress:", string(body))
 
 	if err != nil {
 		return false, "", fmt.Errorf("read body failed: %w", err)
