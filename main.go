@@ -2,15 +2,25 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// CourseEntry represents one selectable course row from the course list
+type CourseEntry struct {
+	CourseID    string
+	ClassroomID string
+	Name        string
+}
 
 func main() {
 	//var inputStrings string
@@ -44,10 +54,13 @@ func main() {
 		return
 	}
 
-	cid := idList[idx]
+	entry := idList[idx]
+
+	// show selected ids
+	fmt.Printf("Selected: %s courseID=%s classroomID=%s\n", entry.Name, entry.CourseID, entry.ClassroomID)
 
 	// Fetch chapters from server (no local chapters file)
-	chaptersFilename := fmt.Sprintf("chapters_%s.json", cid)
+	chaptersFilename := fmt.Sprintf("chapters_%s_%s.json", entry.CourseID, entry.ClassroomID)
 	var chaptersJson string
 	if false { // disabled: no local chapters file read
 		data, err := os.ReadFile(chaptersFilename)
@@ -86,8 +99,8 @@ func main() {
 
 		cookies = ParseRawCookie(cookieRaw)
 		fmt.Println(cookies)
-		fmt.Println("https://www.yuketang.cn/v2/api/web/logs/learn/" + cid)
-		chaptersJson = GetChapters(cid, cookies)
+		fmt.Println("https://www.yuketang.cn/v2/api/web/logs/learn/" + entry.ClassroomID)
+		chaptersJson = GetChapters(entry.ClassroomID, cookies)
 		fmt.Print(chaptersJson)
 	}
 
@@ -107,7 +120,7 @@ func main() {
 				if idStr == "" {
 					continue
 				}
-				done, raw, err := GetWatchProgressDetailed(cid, idStr, cookies)
+				done, raw, err := GetWatchProgressDetailed(entry.CourseID, entry.ClassroomID, idStr, cookies)
 				if err != nil {
 					fmt.Printf("[warn] watch progress check failed for %s: %v\n", idStr, err)
 					watchStatus[idStr] = false
@@ -130,7 +143,7 @@ func main() {
 					if idStr == "" {
 						continue
 					}
-					done, raw, err := GetWatchProgressDetailed(cid, idStr, cookies)
+					done, raw, err := GetWatchProgressDetailed(entry.CourseID, entry.ClassroomID, idStr, cookies)
 					if err != nil {
 						fmt.Printf("[warn] watch progress check failed for %s: %v\n", idStr, err)
 						watchStatus[idStr] = false
@@ -145,7 +158,7 @@ func main() {
 		}
 	}
 
-	fmt.Printf("Chapters for course id %s:\n", cid)
+	fmt.Printf("Chapters for course id %s (classroom %s):\n", entry.CourseID, entry.ClassroomID)
 	for ci, ch := range chapters {
 		cname := fmt.Sprintf("%v", ch["chapter_name"])
 		fmt.Printf("%d. %s\n", ci, cname)
@@ -184,6 +197,226 @@ func main() {
 		}
 	}
 
+	// After printing chapters, optionally run heartbeat iteration over all videos
+	iterateAndHeartbeat(chapters, entry, cookies)
+
+}
+
+// iterateAndHeartbeat prompts user then sends heartbeat packets for each video in chapters
+func iterateAndHeartbeat(chapters []map[string]interface{}, entry CourseEntry, cookies []*http.Cookie) {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print("Apply heartbeat to all videos in this course? (y/N): ")
+	ans, _ := reader.ReadString('\n')
+	ans = strings.TrimSpace(strings.ToLower(ans))
+	if ans != "y" && ans != "yes" {
+		fmt.Println("Skipping heartbeat.")
+		return
+	}
+
+	// determine user id
+	userID := cookieValue(cookies, []string{"user_id", "userid", "uid"})
+	if userID == "" {
+		if uid, err := FetchUserID(cookies); err == nil {
+			userID = uid
+		} else {
+			fmt.Printf("[warn] could not determine user_id: %v\n", err)
+		}
+	}
+
+	// iterate chapters and sections
+	for _, ch := range chapters {
+		var sections []map[string]interface{}
+		if sarr, ok := ch["sections"].([]map[string]interface{}); ok {
+			sections = sarr
+		} else if sarr2, ok2 := ch["sections"].([]interface{}); ok2 {
+			for _, sraw := range sarr2 {
+				if s, ok := sraw.(map[string]interface{}); ok {
+					sections = append(sections, s)
+				}
+			}
+		}
+		for _, s := range sections {
+			vidStr := idToString(s["id"])
+			if vidStr == "" {
+				continue
+			}
+			// try to get video_length via watch-progress
+			_, raw, _ := GetWatchProgressDetailed(entry.CourseID, entry.ClassroomID, vidStr, cookies)
+			totalSec := int64(60)
+			if vl, ok := parseVideoLengthFromRaw(raw, vidStr); ok {
+				totalSec = vl
+			}
+			// parse ids
+			vidInt, _ := strconv.ParseInt(vidStr, 10, 64)
+			cID := entry.CourseID
+			cls := entry.ClassroomID
+			// send heartbeats (default interval 60s)
+			SendHeartbeatsForVideo(cID, cls, userID, vidInt, totalSec, 60, cookies)
+		}
+	}
+}
+
+// parseVideoLengthFromRaw extracts video_length (seconds) from raw response; returns (value, found)
+func parseVideoLengthFromRaw(raw string, videoID string) (int64, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	if i := strings.Index(raw, "{"); i >= 0 {
+		raw = raw[i:]
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &root); err != nil {
+		return 0, false
+	}
+	// look under data[videoID]
+	if dataAny, ok := root["data"]; ok {
+		if dataMap, ok := dataAny.(map[string]interface{}); ok {
+			if vidAny, ok := dataMap[videoID]; ok {
+				if vidMap, ok := vidAny.(map[string]interface{}); ok {
+					if vl, ok := vidMap["video_length"]; ok {
+						switch t := vl.(type) {
+						case float64:
+							return int64(t), true
+						case string:
+							if iv, err := strconv.ParseInt(t, 10, 64); err == nil {
+								return iv, true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	// try top-level
+	if vidAny, ok := root[videoID]; ok {
+		if vidMap, ok := vidAny.(map[string]interface{}); ok {
+			if vl, ok := vidMap["video_length"]; ok {
+				switch t := vl.(type) {
+				case float64:
+					return int64(t), true
+				case string:
+					if iv, err := strconv.ParseInt(t, 10, 64); err == nil {
+						return iv, true
+					}
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// SendHeartbeatsForVideo sends heartbeat GET requests to mark progress for a single video
+func SendHeartbeatsForVideo(courseID string, classroomID string, userID string, videoID int64, totalSec int64, intervalSec int64, cookies []*http.Cookie) {
+	if totalSec <= 0 {
+		totalSec = int64(intervalSec)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	endpoint := "https://www.yuketang.cn/video-log/heartbeat/"
+
+	// try to parse numeric course and user ids
+	var courseNum int64
+	if v, err := strconv.ParseInt(courseID, 10, 64); err == nil {
+		courseNum = v
+	}
+	var userNum int64
+	if v, err := strconv.ParseInt(userID, 10, 64); err == nil {
+		userNum = v
+	}
+
+	for cp := int64(0); cp < totalSec; cp += int64(intervalSec) {
+		heart := map[string]interface{}{
+			"i":           5,
+			"et":          "loadstart",
+			"p":           "web",
+			"n":           "ali-cdn.xuetangx.com",
+			"lob":         "ykt",
+			"cp":          cp,
+			"fp":          0,
+			"tp":          cp,
+			"sp":          1,
+			"ts":          fmt.Sprintf("%d", time.Now().UnixNano()/1e6),
+			"u":           userNum,
+			"uip":         "",
+			"c":           courseNum,
+			"v":           videoID,
+			"skuid":       13318608,
+			"classroomid": classroomID,
+			"cc":          "D8E356C1339D5C51B463AB73BD4C026B",
+			"d":           0,
+			"pg":          fmt.Sprintf("%d_ndl0", videoID),
+			"sq":          1,
+			"t":           "video",
+			"cards_id":    0,
+			"slide":       0,
+			"v_url":       "",
+		}
+		body := map[string]interface{}{"heart_data": []interface{}{heart}}
+		b, _ := json.Marshal(body)
+
+		req, _ := http.NewRequest("POST", endpoint, bytes.NewReader(b))
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; heartbeat-bot/1.0)")
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("heartbeat error vid=%d cp=%d: %v", videoID, cp, err)
+		} else {
+			_, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			log.Printf("sent heartbeat vid=%d cp=%d -> status=%s", videoID, cp, resp.Status)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// final packet at exact end
+	cp := totalSec
+	heart := map[string]interface{}{
+		"i":           5,
+		"et":          "timeupdate",
+		"p":           "web",
+		"n":           "ali-cdn.xuetangx.com",
+		"lob":         "ykt",
+		"cp":          cp,
+		"fp":          0,
+		"tp":          cp,
+		"sp":          1,
+		"ts":          fmt.Sprintf("%d", time.Now().UnixNano()/1e6),
+		"u":           userNum,
+		"uip":         "",
+		"c":           courseNum,
+		"v":           videoID,
+		"skuid":       13318608,
+		"classroomid": classroomID,
+		"cc":          "D8E356C1339D5C51B463AB73BD4C026B",
+		"d":           0,
+		"pg":          fmt.Sprintf("%d_ndl0", videoID),
+		"sq":          1,
+		"t":           "video",
+		"cards_id":    0,
+		"slide":       0,
+		"v_url":       "",
+	}
+	body := map[string]interface{}{"heart_data": []interface{}{heart}}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("POST", endpoint, bytes.NewReader(b))
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; heartbeat-bot/1.0)")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("final heartbeat error vid=%d: %v", videoID, err)
+	} else {
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		log.Printf("final heartbeat vid=%d -> status=%s", videoID, resp.Status)
+	}
 }
 
 func GetCourseList(Cookie []*http.Cookie) string {
@@ -262,17 +495,17 @@ func UnmarshalCourseList(CouserListText []byte) map[string]interface{} {
 	json.Unmarshal(CouserListText, &ParsedCouserListText)
 	return ParsedCouserListText
 }
-func PrintCourseTableReturnIDList(ParsedCourseList map[string]interface{}) []string {
+func PrintCourseTableReturnIDList(ParsedCourseList map[string]interface{}) []CourseEntry {
 	data, ok := ParsedCourseList["data"].(map[string]interface{})
 	if !ok {
 		fmt.Println("Failed to parse 'data' field")
 
-		return make([]string, 0)
+		return make([]CourseEntry, 0)
 	}
 	list := data["list"]
 
 	// You can now use 'list' as needed, e.g., print or process it
-	var idList []string
+	var idList []CourseEntry
 	for index, p := range list.([]interface{}) {
 		row := p.(map[string]interface{})
 		courseObj := row["course"].(map[string]interface{})
@@ -280,20 +513,30 @@ func PrintCourseTableReturnIDList(ParsedCourseList map[string]interface{}) []str
 		// course name (may be string or nil)
 		courseName := fmt.Sprintf("%v", courseObj["name"])
 
-		// Use classroom_id for the chapters API (cid)
-		var idStr string
+		// extract classroom_id
+		var classroomID string
 		switch v := row["classroom_id"].(type) {
 		case string:
-			idStr = v
+			classroomID = v
 		case float64:
-			idStr = strconv.FormatInt(int64(v), 10)
+			classroomID = strconv.FormatInt(int64(v), 10)
 		default:
-			idStr = fmt.Sprintf("%v", v)
+			classroomID = fmt.Sprintf("%v", v)
 		}
 
-		idList = append(idList, idStr)
-		fmt.Printf("%-2d %-10s\n", index, courseName)
+		// extract course id from courseObj
+		var courseID string
+		switch v := courseObj["id"].(type) {
+		case string:
+			courseID = v
+		case float64:
+			courseID = strconv.FormatInt(int64(v), 10)
+		default:
+			courseID = fmt.Sprintf("%v", v)
+		}
 
+		idList = append(idList, CourseEntry{CourseID: courseID, ClassroomID: classroomID, Name: courseName})
+		fmt.Printf("%-2d %-40s courseID=%s classroomID=%s\n", index, courseName, courseID, classroomID)
 	}
 	return idList
 }
@@ -489,9 +732,9 @@ func FetchUserID(Cookie []*http.Cookie) (string, error) {
 
 // GetWatchProgress queries the yuketang watch-progress endpoint for a single video id.
 // GetWatchProgressDetailed queries the watch-progress endpoint and returns the completed flag and raw response body.
-func GetWatchProgressDetailed(cid string, videoID string, Cookie []*http.Cookie) (bool, string, error) {
+func GetWatchProgressDetailed(courseID string, classroomID string, videoID string, Cookie []*http.Cookie) (bool, string, error) {
 	userID := cookieValue(Cookie, []string{"user_id", "userid", "uid"})
-	classroomID := cookieValue(Cookie, []string{"classroom_id", "classroomid", "classroom-id", "classroom"})
+	cookieClassroom := cookieValue(Cookie, []string{"classroom_id", "classroomid", "classroom-id", "classroom"})
 
 	// normalize userID if present in cookies (could be scientific-notation string)
 	if userID != "" {
@@ -507,15 +750,15 @@ func GetWatchProgressDetailed(cid string, videoID string, Cookie []*http.Cookie)
 		}
 	}
 
-	// normalize classroomID from cookies if present; fallback to cid
-	if classroomID != "" {
-		classroomID = normalizeNumericString(classroomID)
+	// normalize classroomID from cookies if present; fallback to courseID
+	if cookieClassroom != "" {
+		classroomID = normalizeNumericString(cookieClassroom)
 	}
 	if classroomID == "" {
-		classroomID = normalizeNumericString(cid)
+		classroomID = normalizeNumericString(courseID)
 	}
 
-	targetUrl := fmt.Sprintf("https://www.yuketang.cn/video-log/get_video_watch_progress/?cid=%s&user_id=%s&classroom_id=%s&video_type=video&vtype=rate&video_id=%s&snapshot=1", cid, userID, classroomID, videoID)
+	targetUrl := fmt.Sprintf("https://www.yuketang.cn/video-log/get_video_watch_progress/?cid=%s&user_id=%s&classroom_id=%s&video_type=video&vtype=rate&video_id=%s&snapshot=1", courseID, userID, classroomID, videoID)
 	fmt.Printf("[debug] watch-progress request: user_id=%s classroom_id=%s video_id=%s url=%s\n", userID, classroomID, videoID, targetUrl)
 
 	client := &http.Client{}
