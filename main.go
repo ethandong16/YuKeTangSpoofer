@@ -523,6 +523,7 @@ func GetWatchProgressDetailed(cid string, videoID string, Cookie []*http.Cookie)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Referer", "https://www.yuketang.cn/")
+	req.Header.Set("xtbz", "ykt")
 	for _, p := range Cookie {
 		req.AddCookie(p)
 	}
@@ -540,6 +541,27 @@ func GetWatchProgressDetailed(cid string, videoID string, Cookie []*http.Cookie)
 	}
 
 	rawBody := string(body)
+
+	// helper to format numeric values nicely
+	formatNumber := func(v interface{}) string {
+		switch t := v.(type) {
+		case float64:
+			if math.Trunc(t) == t {
+				return strconv.FormatInt(int64(t), 10)
+			}
+			return strconv.FormatFloat(t, 'f', -1, 64)
+		case int:
+			return strconv.FormatInt(int64(t), 10)
+		case int64:
+			return strconv.FormatInt(t, 10)
+		case string:
+			return normalizeNumericString(t)
+		default:
+			return fmt.Sprintf("%v", v)
+		}
+	}
+
+	// Try to parse JSON and extract completed + video_length if present.
 	raw := fmt.Sprintf("status=%d body=%s", resp.StatusCode, rawBody)
 
 	var root map[string]interface{}
@@ -548,11 +570,39 @@ func GetWatchProgressDetailed(cid string, videoID string, Cookie []*http.Cookie)
 		return false, raw, fmt.Errorf("invalid json: %w; head=%.200s", err, raw)
 	}
 
+	// local helper to extract completed and video_length from a map
+	extractFromMap := func(vidMap map[string]interface{}) (bool, string, error) {
+		// completed
+		done, err := completedFromMap(vidMap)
+		if err != nil {
+			// completed field missing or invalid -> return error so caller can decide
+			// but still try to extract video_length for debugging
+			vlen := ""
+			if vl, ok := vidMap["video_length"]; ok {
+				vlen = formatNumber(vl)
+			}
+			if vlen != "" {
+				// append video_length to raw for caller visibility
+				raw = fmt.Sprintf("status=%d video_length=%s body=%s", resp.StatusCode, vlen, rawBody)
+			}
+			return false, vlen, err
+		}
+		// video_length (optional)
+		vlen := ""
+		if vl, ok := vidMap["video_length"]; ok {
+			vlen = formatNumber(vl)
+		}
+		if vlen != "" {
+			raw = fmt.Sprintf("status=%d video_length=%s body=%s", resp.StatusCode, vlen, rawBody)
+		}
+		return done, vlen, nil
+	}
+
 	if dataAny, ok := root["data"]; ok {
 		if dataMap, ok := dataAny.(map[string]interface{}); ok {
 			if vidAny, ok := dataMap[videoID]; ok {
 				if vidMap, ok := vidAny.(map[string]interface{}); ok {
-					done, err := completedFromMap(vidMap)
+					done, _, err := extractFromMap(vidMap)
 					return done, raw, err
 				}
 			}
@@ -560,9 +610,40 @@ func GetWatchProgressDetailed(cid string, videoID string, Cookie []*http.Cookie)
 	}
 	if vidAny, ok := root[videoID]; ok {
 		if vidMap, ok := vidAny.(map[string]interface{}); ok {
-			done, err := completedFromMap(vidMap)
+			done, _, err := extractFromMap(vidMap)
 			return done, raw, err
 		}
+	}
+
+	// As a fallback, try to find video_length anywhere under data or root keyed by numeric-like keys
+	// (some responses may include video info under top-level numeric keys)
+	// We'll try to find a map that contains "completed" and "video_length"
+	var fallbackVlen string
+	foundCompleted := false
+	var findInMap func(map[string]interface{})
+	findInMap = func(m map[string]interface{}) {
+		if foundCompleted {
+			return
+		}
+		if _, ok := m["completed"]; ok {
+			if vl, ok2 := m["video_length"]; ok2 {
+				fallbackVlen = formatNumber(vl)
+			}
+			foundCompleted = true
+		} else {
+			for _, v := range m {
+				if subm, ok := v.(map[string]interface{}); ok {
+					findInMap(subm)
+					if foundCompleted {
+						return
+					}
+				}
+			}
+		}
+	}
+	findInMap(root)
+	if fallbackVlen != "" {
+		raw = fmt.Sprintf("status=%d video_length=%s body=%s", resp.StatusCode, fallbackVlen, rawBody)
 	}
 
 	return false, raw, fmt.Errorf("no progress info for video id %s; http status=%d; resp head=%.200s", videoID, resp.StatusCode, raw)
