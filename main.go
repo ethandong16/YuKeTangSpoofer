@@ -65,7 +65,7 @@ func main() {
 	if false { // disabled: no local chapters file read
 		data, err := os.ReadFile(chaptersFilename)
 		if err != nil {
-			fmt.Println("Failed to read local chapters file:", err)
+			log.Printf("Failed to read local chapters file: %v", err)
 			return
 		}
 		chaptersJson = string(data)
@@ -79,9 +79,9 @@ func main() {
 			data, err := os.ReadFile(cookieFilename)
 			if err == nil {
 				cookieRaw = strings.TrimSpace(string(data))
-				fmt.Println("Using cookie from", cookieFilename)
+				log.Println("Using cookie from", cookieFilename)
 			} else {
-				fmt.Println("Failed to read cookie file:", err)
+				log.Printf("Failed to read cookie file: %v", err)
 			}
 		}
 
@@ -92,21 +92,18 @@ func main() {
 			cookieRaw, _ = reader.ReadString('\n')
 			cookieRaw = strings.TrimSpace(cookieRaw)
 			if cookieRaw == "" {
-				fmt.Println("No cookie provided — aborting.")
+				log.Println("No cookie provided — aborting.")
 				return
 			}
 		}
 
 		cookies = ParseRawCookie(cookieRaw)
-		fmt.Println(cookies)
-		fmt.Println("https://www.yuketang.cn/v2/api/web/logs/learn/" + entry.ClassroomID)
 		chaptersJson = GetChapters(entry.ClassroomID, cookies)
-		fmt.Print(chaptersJson)
 	}
 
 	chapters, err := ParseChapters([]byte(chaptersJson))
 	if err != nil {
-		fmt.Println("Failed to parse chapters:", err)
+		log.Printf("Failed to parse chapters: %v", err)
 		return
 	}
 
@@ -120,21 +117,13 @@ func main() {
 				if idStr == "" {
 					continue
 				}
-				done, raw, err := GetWatchProgressDetailed(entry.CourseID, entry.ClassroomID, idStr, cookies)
+				done, _, err := GetWatchProgressDetailed(entry.CourseID, entry.ClassroomID, idStr, cookies)
 				if err != nil {
-					fmt.Printf("[warn] watch progress check failed for %s: %v\n", idStr, err)
+					log.Printf("[warn] watch progress check failed for %s: %v", idStr, err)
 					watchStatus[idStr] = false
 					continue
 				}
 				watchStatus[idStr] = done
-				if raw != "" {
-					fmt.Printf("[debug] id=%s raw response: %s\n", idStr, raw)
-					if cval, found, perr := ParseCompletedFromRaw(raw, idStr); perr == nil && found {
-						fmt.Printf("[debug] id=%s parsed completed=%d\n", idStr, cval)
-					} else if perr != nil {
-						fmt.Printf("[debug] id=%s parse error: %v\n", idStr, perr)
-					}
-				}
 			}
 		} else if sarr2, ok2 := ch["sections"].([]interface{}); ok2 {
 			for _, sraw := range sarr2 {
@@ -143,16 +132,13 @@ func main() {
 					if idStr == "" {
 						continue
 					}
-					done, raw, err := GetWatchProgressDetailed(entry.CourseID, entry.ClassroomID, idStr, cookies)
+					done, _, err := GetWatchProgressDetailed(entry.CourseID, entry.ClassroomID, idStr, cookies)
 					if err != nil {
-						fmt.Printf("[warn] watch progress check failed for %s: %v\n", idStr, err)
+						log.Printf("[warn] watch progress check failed for %s: %v", idStr, err)
 						watchStatus[idStr] = false
 						continue
 					}
 					watchStatus[idStr] = done
-					if raw != "" {
-						fmt.Printf("[debug] id=%s raw response: %s\n", idStr, raw)
-					}
 				}
 			}
 		}
@@ -232,7 +218,7 @@ func iterateAndHeartbeat(chapters []map[string]interface{}, entry CourseEntry, c
 		if uid, err := FetchUserID(cookies); err == nil {
 			userID = uid
 		} else {
-			fmt.Printf("[warn] could not determine user_id: %v\n", err)
+			log.Printf("[warn] could not determine user_id: %v\n", err)
 		}
 	}
 
@@ -450,7 +436,7 @@ func GetCourseList(Cookie []*http.Cookie) string {
 	client := &http.Client{}
 
 	if err != nil {
-		fmt.Print(fmt.Errorf("couldn't create request object: %w", err))
+		log.Print(fmt.Errorf("couldn't create request object: %w", err))
 	}
 
 	for _, p := range Cookie {
@@ -458,14 +444,14 @@ func GetCourseList(Cookie []*http.Cookie) string {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Println("HTTP request failed:", err)
+		log.Println("HTTP request failed:", err)
 		return ""
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Println("Failed to read response body:", err)
+		log.Println("Failed to read response body:", err)
 		return ""
 	}
 
@@ -511,7 +497,7 @@ func ParseRawCookie(raw string) []*http.Cookie {
 		}
 	}
 	if !need["sessionid"] || !need["csrftoken"] {
-		fmt.Println("[warn] cookie missing likely-required keys:", need)
+		log.Println("[warn] cookie missing likely-required keys:", need)
 	}
 	return cookies
 }
@@ -523,7 +509,7 @@ func UnmarshalCourseList(CouserListText []byte) map[string]interface{} {
 func PrintCourseTableReturnIDList(ParsedCourseList map[string]interface{}) []CourseEntry {
 	data, ok := ParsedCourseList["data"].(map[string]interface{})
 	if !ok {
-		fmt.Println("Failed to parse 'data' field")
+		log.Println("Failed to parse 'data' field")
 
 		return make([]CourseEntry, 0)
 	}
@@ -582,18 +568,18 @@ func GetChapters(cid string, Cookie []*http.Cookie) string {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Println("HTTP request failed:", err)
+		log.Println("HTTP request failed:", err)
 		return ""
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Println("Failed to read response body:", err)
+		log.Println("Failed to read response body:", err)
 		return ""
 	}
 	if resp.StatusCode != 200 {
-		fmt.Printf("[warn] non-200 status %d from chapters API, body head: %.200s\n", resp.StatusCode, string(body))
+		log.Printf("[warn] non-200 status %d from chapters API, body head: %.200s\n", resp.StatusCode, string(body))
 	}
 	return string(body)
 
@@ -787,7 +773,6 @@ func GetWatchProgressDetailed(courseID string, classroomID string, videoID strin
 	}
 
 	targetUrl := fmt.Sprintf("https://www.yuketang.cn/video-log/get_video_watch_progress/?cid=%s&user_id=%s&classroom_id=%s&video_type=video&vtype=rate&video_id=%s&snapshot=1", courseID, userID, classroomID, videoID)
-	fmt.Printf("[debug] watch-progress request: user_id=%s classroom_id=%s video_id=%s url=%s\n", userID, classroomID, videoID, targetUrl)
 
 	client := &http.Client{}
 	req, _ := http.NewRequest("GET", targetUrl, nil)
@@ -805,7 +790,6 @@ func GetWatchProgressDetailed(courseID string, classroomID string, videoID strin
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
-	fmt.Println("get_progress:", string(body))
 
 	if err != nil {
 		return false, "", fmt.Errorf("read body failed: %w", err)
