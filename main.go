@@ -198,12 +198,12 @@ func main() {
 	}
 
 	// After printing chapters, optionally run heartbeat iteration over all videos
-	iterateAndHeartbeat(chapters, entry, cookies)
+	iterateAndHeartbeat(chapters, entry, cookies, watchStatus)
 
 }
 
 // iterateAndHeartbeat prompts user then sends heartbeat packets for each video in chapters
-func iterateAndHeartbeat(chapters []map[string]interface{}, entry CourseEntry, cookies []*http.Cookie) {
+func iterateAndHeartbeat(chapters []map[string]interface{}, entry CourseEntry, cookies []*http.Cookie, watchStatus map[string]bool) {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Print("Apply heartbeat to all videos in this course? (y/N): ")
 	ans, _ := reader.ReadString('\n')
@@ -212,6 +212,19 @@ func iterateAndHeartbeat(chapters []map[string]interface{}, entry CourseEntry, c
 		fmt.Println("Skipping heartbeat.")
 		return
 	}
+
+	// Channel to signal skipping the current video
+	skipChan := make(chan bool)
+
+	// Goroutine to listen for 's' input
+	go func() {
+		for {
+			input, _, _ := reader.ReadRune()
+			if input == 's' {
+				skipChan <- true
+			}
+		}
+	}()
 
 	// determine user id
 	userID := cookieValue(cookies, []string{"user_id", "userid", "uid"})
@@ -239,6 +252,19 @@ func iterateAndHeartbeat(chapters []map[string]interface{}, entry CourseEntry, c
 			vidStr := idToString(s["id"])
 			if vidStr == "" {
 				continue
+			}
+
+			if done, ok := watchStatus[vidStr]; ok && done {
+				log.Printf("skipping heartbeat for video %s (already completed)", vidStr)
+				continue
+			}
+
+			select {
+			case <-skipChan:
+				log.Println("Skipping current video...")
+				continue
+			default:
+				// continue with heartbeat
 			}
 
 			// parse ids
@@ -618,6 +644,9 @@ func ParseChapters(jsonBytes []byte) ([]map[string]interface{}, error) {
 			if sectionsRaw, ok := sr.([]interface{}); ok {
 				for _, s := range sectionsRaw {
 					if sec, ok := s.(map[string]interface{}); ok {
+						if leafType, ok := sec["leaf_type"].(float64); ok && leafType != 0 {
+							continue // Skip if leaf_type is not 0
+						}
 						secName := sec["name"]
 						secID := sec["id"]
 						sectionList = append(sectionList, map[string]interface{}{
